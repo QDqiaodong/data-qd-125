@@ -1,0 +1,55 @@
+{
+  "as_of": "2026-01-01T01:00:00Z",
+  "session_gap_seconds": 1800,
+  "lookback_seconds": 3600,
+  "events": [
+    {
+      "id": "E1",
+      "user": "U1",
+      "at": "2026-01-01T00:00:00Z",
+      "kind": "touch",
+      "channel": "email",
+      "amount_cents": null
+    },
+    {
+      "id": "E2",
+      "user": "U1",
+      "at": "2026-01-01T00:10:00Z",
+      "kind": "touch",
+      "channel": "direct",
+      "amount_cents": null
+    },
+    {
+      "id": "P1",
+      "user": "U1",
+      "at": "2026-01-01T00:15:00Z",
+      "kind": "purchase",
+      "channel": null,
+      "amount_cents": 1000
+    },
+    {
+      "id": "P2",
+      "user": "U1",
+      "at": "2026-01-01T00:45:01Z",
+      "kind": "purchase",
+      "channel": null,
+      "amount_cents": 500
+    },
+    {
+      "id": "P3",
+      "user": "U2",
+      "at": "2026-01-01T00:20:00Z",
+      "kind": "purchase",
+      "channel": null,
+      "amount_cents": 100
+    },
+    {
+      "id": "F1",
+      "user": "U1",
+      "at": "2026-01-01T02:00:00Z",
+      "kind": "touch",
+      "channel": "search",
+      "amount_cents": null
+    }
+  ]
+}
