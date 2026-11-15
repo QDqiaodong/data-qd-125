@@ -51,6 +51,19 @@ python -m visit_attribution.cli export --db run/store.db --output run/report.jso
 PYTHONPATH=src python3 -I experiments/run_experiments.py --out run/experiments
 ```
 
+## 差分隐私发布
+
+另增用户级差分隐私发布：独立 SQLite 账本固定总预算，按 UTC 日×公开渠道发布
+加噪独立用户计数（未知渠道归 other、公开域补零、每用户限前 L 桶、每桶独立
+Laplace(L/epsilon)）。账本精确累计 epsilon、并发不超支、同规范请求幂等重放，
+源库只读单快照。契约与规则详见 [差分隐私发布文档](docs/privacy.md)。
+
+```sh
+python -m visit_attribution.cli privacy-init    --ledger run/privacy.db --budget 10
+python -m visit_attribution.cli privacy-release --source run/store.db \
+    --ledger run/privacy.db --request request.json --output run/release.json
+```
+
 ## 业务与样例结果
 
 6事件中1未来排除，形成3会话、3转化/1600分；email归因1500分、unattributed100分。
