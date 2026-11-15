@@ -26,6 +26,19 @@ republishes the stored payload for free.
 The source store is opened read-only and read inside a single snapshot
 transaction, so concurrent batch application cannot produce a mixed read
 and the release path never modifies source tables or attribution rows.
+
+Erasure coordination (generation fence): every committed source mutation
+(``apply``/``erase``) advances a ``write_generation`` counter in the source
+``meta`` table. A release records the generation of its snapshot and, while
+holding a fresh read-only source transaction, re-reads that generation inside
+the ledger write transaction. If an erasure (or any writer) committed in
+between, the release aborts *before* charging or storing anything and the
+caller retries against the new snapshot. The recheck read transaction stays
+open until the ledger commits: a concurrent writer cannot reach its exclusive
+commit lock while the shared lock is held, so the order is always a clean
+"release before erasure" or "erasure before release" linearization, never a
+stale charge. Writers that hit the lock wait on ``busy_timeout`` (bounded
+blocking, retryable) rather than being refused outright.
 """
 import hashlib
 import json
@@ -35,6 +48,7 @@ import re
 import secrets
 import sqlite3
 import tempfile
+import time
 import urllib.parse
 from datetime import date, timedelta
 from pathlib import Path
@@ -49,10 +63,39 @@ _MAX_DAYS = 366
 _MAX_CHANNELS = 64
 _MAX_L = 10 ** 6
 _FAULT_ENV = 'VA_PRIVACY_FAULT_AFTER_COMMIT'
+# Cross-process test barrier: when set to a directory, a release signals
+# <dir>/snapshot-read after its source snapshot and waits for release-proceed;
+# <dir>/fence-held is signaled while the generation recheck lock is open.
+_SNAPSHOT_BARRIER_ENV = 'VA_PRIVACY_SNAPSHOT_BARRIER'
+_FENCE_BARRIER_ENV = 'VA_ERASE_BARRIER'
 
 # Test-only hook invoked inside the source snapshot transaction after the
 # watermark read; lets tests interleave a concurrent source write.
 _snapshot_hook = None
+# Test-only hook invoked after the snapshot is built and before the ledger
+# write transaction starts; lets tests commit an erasure in the fence window.
+_commit_barrier = None
+
+
+def _barrier_dir(env_name):
+    path = os.environ.get(env_name)
+    return Path(path) if path else None
+
+
+def _barrier_signal(directory, name):
+    if directory is not None:
+        (directory / name).write_text('1')
+
+
+def _barrier_wait(directory, name):
+    if directory is None:
+        return
+    flag = directory / name
+    deadline = time.monotonic() + 30
+    while not flag.exists():
+        if time.monotonic() > deadline:
+            raise PrivacyError('test barrier timed out waiting for ' + name)
+        time.sleep(0.02)
 
 _DDL = (
     'CREATE TABLE meta('
@@ -64,6 +107,7 @@ _DDL = (
     'spec_sha256 TEXT NOT NULL,'
     'epsilon_scaled TEXT NOT NULL,'
     'payload BLOB NOT NULL,'
+    'source_generation INTEGER NOT NULL DEFAULT 0,'
     "created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
     ') WITHOUT ROWID',
 )
@@ -156,8 +200,13 @@ def _connect_readonly(path):
     return conn
 
 
+def _read_generation(conn):
+    row = conn.execute("SELECT value FROM meta WHERE key='write_generation'").fetchone()
+    return 0 if row is None else int(row[0])
+
+
 def _read_snapshot(source, request):
-    """Consistent single-transaction read of watermark and clipped counts."""
+    """Consistent single-transaction read of watermark, generation and counts."""
     conn = _connect_readonly(source)
     try:
         conn.execute('BEGIN')
@@ -170,6 +219,7 @@ def _read_snapshot(source, request):
             if row is None:
                 raise PrivacyError('source database has no applied batches')
             as_of = row[0]
+            generation = _read_generation(conn)
             if _snapshot_hook is not None:
                 _snapshot_hook()
             public = request['public']
@@ -196,7 +246,13 @@ def _read_snapshot(source, request):
                 'GROUP BY day, bucket', params).fetchall()
             counts = {(day, bucket): n for day, bucket, n in rows}
             conn.execute('COMMIT')
-            return {'as_of': as_of, 'counts': counts}
+            barrier = _barrier_dir(_SNAPSHOT_BARRIER_ENV)
+            if barrier is not None:
+                # Pause with a finished snapshot but no ledger charge: lets an
+                # external process commit an erasure inside the fence window.
+                _barrier_signal(barrier, 'snapshot-read')
+                _barrier_wait(barrier, 'release-proceed')
+            return {'as_of': as_of, 'generation': generation, 'counts': counts}
         except Exception:
             try:
                 conn.execute('ROLLBACK')
@@ -205,6 +261,35 @@ def _read_snapshot(source, request):
             raise
     finally:
         conn.close()
+
+
+def _fence_generation(source, generation):
+    """Re-read the source generation while holding a shared read transaction.
+
+    The transaction is left open and returned to the caller; its shared lock
+    blocks a concurrent writer's exclusive commit until the ledger transaction
+    has finished, closing the check-then-act window. A stale generation raises
+    before any ledger charge.
+    """
+    conn = _connect_readonly(source)
+    conn.execute('BEGIN')
+    current = _read_generation(conn)
+    if current != generation:
+        conn.execute('ROLLBACK')
+        conn.close()
+        raise PrivacyError(
+            'source changed since snapshot (generation %d -> %d); '
+            'release aborted without charging, retry the request'
+            % (generation, current))
+    fence_barrier = _barrier_dir(_FENCE_BARRIER_ENV)
+    if fence_barrier is not None:
+        # Hold the shared lock and let an external eraser reach (and block on)
+        # the writer lock. The eraser's own blocked state is the synchronization
+        # point; waiting for a file here would deadlock, so we only signal and
+        # give the scheduler a short, bounded window.
+        _barrier_signal(fence_barrier, 'fence-held')
+        time.sleep(1.0)
+    return conn
 
 
 def _laplace(scale, rng):
@@ -249,6 +334,12 @@ def _open_ledger(path):
     if not {'meta', 'releases'} <= tables:
         conn.close()
         raise PrivacyError('ledger is not initialized: ' + str(path))
+    # Additive migration: ledgers created before erasure support lack the
+    # source-generation fence column. Existing rows are stamped generation 0
+    # (the pre-fence era); their stored payloads and budget are untouched.
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(releases)')}
+    if 'source_generation' not in columns:
+        conn.execute('ALTER TABLE releases ADD COLUMN source_generation INTEGER NOT NULL DEFAULT 0')
     return conn
 
 
@@ -299,9 +390,19 @@ def init_ledger(path, budget_text):
 
 
 def release(source, ledger, request_path, output, rng=None):
-    """Charge the ledger and publish one noisy day/channel count release."""
+    """Charge the ledger and publish one noisy day/channel count release.
+
+    Fresh releases are fenced against source erasures: the snapshot's source
+    generation is re-checked inside the ledger write transaction under a
+    held read-only source lock, and a stale snapshot aborts without charging.
+    Replays of an already stored release_id never touch the source.
+    """
     if rng is None:
-        rng = secrets.SystemRandom().random
+        if os.environ.get('VA_PRIVACY_RNG_ZERO'):
+            # Test-only deterministic source: every Laplace draw is exactly 0.
+            rng = lambda: 0.5
+        else:
+            rng = secrets.SystemRandom().random
     request = _load_request(request_path)
     dest = Path(output)
     if dest.is_symlink():
@@ -311,20 +412,34 @@ def release(source, ledger, request_path, output, rng=None):
         raise PrivacyError('output must differ from source, ledger and request')
     payload = None
     replayed = False
+    as_of = None
     conn = _open_ledger(ledger)
     try:
-        row = conn.execute('SELECT spec_sha256, payload FROM releases WHERE release_id=?',
-                           (request['release_id'],)).fetchone()
-        if row is None:
+        row = conn.execute(
+            'SELECT spec_sha256, payload, source_generation FROM releases '
+            'WHERE release_id=?', (request['release_id'],)).fetchone()
+        if row is not None:
+            if row[0] != request['spec_sha256']:
+                raise PrivacyError('release_id already used with different parameters')
+            payload = row[1]
+            replayed = True
+        else:
             snapshot = _read_snapshot(source, request)
             candidate = _build_payload(request, snapshot, rng)
             as_of = snapshot['as_of']
+            if _commit_barrier is not None:
+                _commit_barrier(snapshot['generation'])
             conn.execute('BEGIN IMMEDIATE')
+            source_lock = None
             try:
                 row = conn.execute(
-                    'SELECT spec_sha256, payload FROM releases WHERE release_id=?',
+                    'SELECT spec_sha256, payload, source_generation FROM releases '
+                    'WHERE release_id=?',
                     (request['release_id'],)).fetchone()
                 if row is None:
+                    # Hold the shared source lock until the ledger commits so a
+                    # concurrent erasure cannot land between check and commit.
+                    source_lock = _fence_generation(source, snapshot['generation'])
                     spent = int(_meta(conn, 'epsilon_spent_scaled'))
                     budget = int(_meta(conn, 'epsilon_budget_scaled'))
                     if spent + request['epsilon_scaled'] > budget:
@@ -334,27 +449,33 @@ def release(source, ledger, request_path, output, rng=None):
                                               _canonical(budget - spent),
                                               _canonical(budget)))
                     conn.execute(
-                        'INSERT INTO releases(release_id,spec_sha256,epsilon_scaled,payload) '
-                        'VALUES(?,?,?,?)',
+                        'INSERT INTO releases(release_id,spec_sha256,epsilon_scaled,'
+                        'payload,source_generation) VALUES(?,?,?,?,?)',
                         (request['release_id'], request['spec_sha256'],
-                         str(request['epsilon_scaled']), candidate))
+                         str(request['epsilon_scaled']), candidate,
+                         snapshot['generation']))
                     _set_meta(conn, 'epsilon_spent_scaled',
                               str(spent + request['epsilon_scaled']))
                     conn.execute('COMMIT')
                     payload = candidate
                 else:
+                    # A concurrent identical request won the ledger race: its
+                    # stored payload is the idempotent answer for us too.
                     conn.execute('COMMIT')
-            except Exception:
+                    if row[0] != request['spec_sha256']:
+                        raise PrivacyError(
+                            'release_id already used with different parameters')
+                    payload = row[1]
+                    replayed = True
+            except BaseException:
                 try:
                     conn.execute('ROLLBACK')
                 except sqlite3.Error:
                     pass
                 raise
-        if row is not None:
-            if row[0] != request['spec_sha256']:
-                raise PrivacyError('release_id already used with different parameters')
-            payload = row[1]
-            replayed = True
+            finally:
+                if source_lock is not None:
+                    source_lock.close()
         spent = int(_meta(conn, 'epsilon_spent_scaled'))
         budget = int(_meta(conn, 'epsilon_budget_scaled'))
     finally:

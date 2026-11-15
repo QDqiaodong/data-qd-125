@@ -76,6 +76,21 @@ CREATE TABLE IF NOT EXISTS m_conversions(
     last_touch_id TEXT,
     PRIMARY KEY(user, seq)
 ) WITHOUT ROWID;
+-- Erasure support (additive migration; export payload schema stays v2).
+-- tombstones retain only the SHA256 of the UTF-8 user identifier: no row ever
+-- stores the identifier itself, and a tombstone is permanent (no delete path).
+CREATE TABLE IF NOT EXISTS tombstones(
+    user_sha256 TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS erasures(
+    request_id TEXT PRIMARY KEY,
+    spec_sha256 TEXT NOT NULL,
+    user_count INTEGER NOT NULL,
+    unknown_users INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+) WITHOUT ROWID;
 """
 
 
@@ -103,6 +118,22 @@ def _meta(conn, key):
 def _set_meta(conn, key, value):
     conn.execute('INSERT INTO meta(key,value) VALUES(?,?) '
                  'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
+
+
+def _generation(conn):
+    """Current source generation; absent on legacy snapshots means generation 0."""
+    value = _meta(conn, 'write_generation')
+    return 0 if value is None else int(value)
+
+
+def _bump_generation(conn):
+    """One committed source mutation (apply or erase) advances the fence by one."""
+    _set_meta(conn, 'write_generation', _generation(conn) + 1)
+
+
+def _user_tombstoned(conn, user_hash):
+    return conn.execute('SELECT 1 FROM tombstones WHERE user_sha256=?',
+                        (user_hash,)).fetchone() is not None
 
 
 def _load_batch(source):
@@ -228,6 +259,21 @@ def apply_batch(db_path, source):
             return {'batch_id': batch['batch_id'], 'replayed': True, 'inserted_events': 0,
                     'activated_events': 0, 'recomputed_users': 0, 'as_of': _meta(conn, 'as_of')}
 
+        # A tombstoned user can never be re-ingested: the whole batch is
+        # rejected before any row is written, including batches that only
+        # mention the user through otherwise-duplicate events. Only hashes are
+        # surfaced in errors; erased identifiers never reappear in any output.
+        blocked = sorted({
+            digest for digest in (
+                hashlib.sha256(event['user'].encode('utf-8')).hexdigest()
+                for event in batch['events'])
+            if _user_tombstoned(conn, digest)
+        })
+        if blocked:
+            shown = ', '.join(blocked[:5]) + (' ...' if len(blocked) > 5 else '')
+            raise PipelineError('batch references %d erased user(s) and is refused: %s'
+                                % (len(blocked), shown))
+
         gap = _meta(conn, 'session_gap_seconds')
         if gap is None:
             _set_meta(conn, 'schema_version', SCHEMA_VERSION)
@@ -294,6 +340,7 @@ def apply_batch(db_path, source):
 
         for user in sorted(affected):
             _recompute_user(conn, user, batch['gap'], batch['lookback'])
+        _bump_generation(conn)
         conn.execute('COMMIT')
         return {'batch_id': batch['batch_id'], 'replayed': False,
                 'inserted_events': inserted, 'activated_events': activated,

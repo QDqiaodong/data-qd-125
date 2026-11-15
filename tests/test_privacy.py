@@ -484,7 +484,8 @@ class PrivacyTests(unittest.TestCase):
         names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         conn.close()
         self.assertEqual(names, {'meta', 'batches', 'events', 'm_sessions',
-                                 'm_session_events', 'm_conversions'})
+                                 'm_session_events', 'm_conversions',
+                                 'tombstones', 'erasures'})
 
     def test_release_requires_populated_source(self):
         privacy.init_ledger(self.ledger, '10')

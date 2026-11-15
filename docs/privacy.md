@@ -49,7 +49,8 @@ python -m visit_attribution.cli privacy-release --source run/store.db \
   每桶至多贡献 1，因此计数向量的 L1 敏感度为 `L`。
 - 每桶加独立 `Laplace(L/epsilon)` 噪声（逆 CDF 采样，输出实数计数值）。
   生产路径使用 `secrets.SystemRandom`；`privacy.release(..., rng=...)` 可注入
-  确定性随机源，测试据此逐桶重放核验噪声尺度与独立采样顺序。
+  确定性随机源，测试据此逐桶重放核验噪声尺度与独立采样顺序。CLI 级跨进程测试
+  通过 `VA_PRIVACY_RNG_ZERO=1` 令全部噪声退化为确定性零值（仅限测试用途）。
 - 输出只含公开参数（release_id、日期区间、渠道域、L、epsilon、noise_scale）、
   源库水位 `source_as_of` 与噪声计数；不含真实计数、用户标识或单事件信息。
 
@@ -66,11 +67,22 @@ python -m visit_attribution.cli privacy-release --source run/store.db \
   （如目标是目录、注入故障 `VA_PRIVACY_FAULT_AFTER_COMMIT`）保留旧文件，
   重试同一请求走幂等重放免费补发。输出不得为符号链接，且不得与源库/账本/请求同路径。
 
-## 源库一致性
+## 源库一致性与擦除栅栏
 
 源库以 `mode=ro` 只读打开，水位与聚合在**同一读事务**内完成：并发 `apply` 批次
 （含未提交写入）不会造成混合快照，发布路径也不修改源库任何表或归因结果
 （发布前后源库文件字节一致）。源库不存在或无已应用批次时拒绝发布且不扣费。
+
+源库每次提交成功的 `apply`/`erase` 都会推进 `meta.write_generation` 代际计数
+（见 [擦除文档](erasure.md)）。发布流程为：只读快照记录代际 → 账本
+`BEGIN IMMEDIATE` → 在保持打开的只读源事务内复检代际 → 代际一致才扣费提交。
+若快照之后有擦除或批次提交，发布以 `source changed since snapshot` 中止，
+**不扣费、不写载荷、不产文件**，同一请求重试即读到新快照。复检读事务的共享锁
+保持到账本提交，并发写者在 `busy_timeout` 内有界等待而非被拒绝，因此只存在
+"发布先于擦除" 或 "擦除先于发布" 两种干净顺序。
+
+擦除不修改账本：历史发布载荷字节与预算永久不变，已提交 `release_id` 重放始终
+返回原字节、不二次扣费；擦除之后的**新**发布只可能统计擦除后的用户集合。
 
 ## 输出格式
 
@@ -99,7 +111,7 @@ python -m visit_attribution.cli privacy-release --source run/store.db \
 | 表 | 用途 |
 | --- | --- |
 | `meta` | schema 版本、总预算与已花费（均为 10^18 缩放整数十进制串） |
-| `releases` | 每次发布的规范哈希、epsilon、原载荷字节与创建时间 |
+| `releases` | 每次发布的规范哈希、epsilon、原载荷字节、快照源代际 `source_generation` 与创建时间。旧账本打开时自动 `ALTER TABLE` 补列，历史行代际记 0 |
 
 ## 测试
 

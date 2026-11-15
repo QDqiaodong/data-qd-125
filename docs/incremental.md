@@ -72,8 +72,10 @@ python -m visit_attribution.cli --source fixtures/input.json --output run/legacy
 
 一次 `apply` 在单条 `BEGIN IMMEDIATE` 事务内完成：事件插入/激活、批次凭据写入、
 水位与重复数元数据更新、受影响用户物化替换，全部一起提交；任何异常（含注入故障）
-都回滚，库内不会出现半生效状态。SQLite 默认 rollback journal 保证崩溃原子性，
-单操作者模型下不提供并发写入。
+都回滚，库内不会出现半生效状态。SQLite 默认 rollback journal 保证崩溃原子性。
+每次提交成功的 `apply` 都会把 `meta.write_generation` 加一，供隐私发布的代际
+栅栏使用（见 [privacy.md](privacy.md)、[erasure.md](erasure.md)）；重放与被拒
+批次不推进代际。涉及已擦除用户（`tombstones` 命中）的批次在写入前整批拒绝。
 
 ## 导出等价性
 
@@ -88,8 +90,9 @@ python -m visit_attribution.cli --source fixtures/input.json --output run/legacy
 
 | 表 | 用途 |
 | --- | --- |
-| `meta` | schema 版本、固定 gap/lookback、当前 `as_of`、累计批内重复数 |
-| `batches` | 批次凭据（ID、源哈希、字节长度、水位、批内重复数） |
-| `events` | 规范化事件主表，`active` 标记是否已被水位激活，`first_batch_id` 溯源 |
+| `meta` | schema 版本、固定 gap/lookback、当前 `as_of`、累计批内重复数、`write_generation` 代际栅栏计数 |
+| `batches` | 批次凭据（ID、源哈希、字节长度、水位、批内重复数）——擦除后仍保留 |
+| `events` | 规范化事件主表，`active` 标记是否已被水位激活，`first_batch_id` 溯源；擦除目标用户行在单事务内清除（含未来行） |
 | `m_sessions` / `m_session_events` | 每用户会话与成员事件的物化结果 |
 | `m_conversions` | 每用户转化及其两个模型的渠道/触点物化结果 |
+| `tombstones` / `erasures` | 永久墓碑（用户 UTF-8 的 SHA256）与擦除请求凭据，详见 [erasure.md](erasure.md) |

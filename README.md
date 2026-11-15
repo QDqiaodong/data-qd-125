@@ -64,6 +64,22 @@ python -m visit_attribution.cli privacy-release --source run/store.db \
     --ledger run/privacy.db --request request.json --output run/release.json
 ```
 
+## 用户擦除（被遗忘权）
+
+`erase` 在源库单事务内清除请求用户集的全部事件（含未来行）、会话/成员/转化
+物化，只保留用户 UTF-8 标识的 SHA256 永久墓碑与擦除请求凭据；批次凭据、水位
+与其他用户数据保留，未知用户同样立碑封禁。同请求 ID 同规范用户集幂等重放，
+异参或与既有墓碑冲突时整批拒绝；`apply` 遇墓碑用户整批拒绝、已成功批次重放
+仍无副作用。隐私账本历史载荷与预算不变，已提交发布重放取原字节，新发布不可能
+再含已删用户。三命令跨进程并发由源库代际栅栏串行化：擦除提交后，基于旧快照
+未记账的发布中止且不扣费，重试读到新快照；写者仅在 `busy_timeout` 内有界等待，
+不会被一刀切拒绝。设计、方案对比与迁移见 [擦除文档](docs/erasure.md)。
+
+```sh
+python -m visit_attribution.cli erase --db run/store.db --request erase.json
+# erase.json: {"request_id": "ER-001", "users": ["user-a", "user-b"]}
+```
+
 ## 业务与样例结果
 
 6事件中1未来排除，形成3会话、3转化/1600分；email归因1500分、unattributed100分。
