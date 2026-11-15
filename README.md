@@ -27,6 +27,30 @@ python3 -m venv .venv
 src/visit_attribution/model.py 为业务模型，相关算法模块独立组织；common.py 提供受限JSON及报告发布，
 cli.py 衔接数据链路。fixtures 为明确自制样例，代码与样例采用MIT许可。
 
+## SQLite 增量管道
+
+旧的全量快照 CLI 原样保留；另增基于 SQLite 的增量管道，业务规则与全量模型一致，
+导出 `result` 的字段与顺序等价于把累计输入交给全量模型。设计与表结构见
+[增量管道文档](docs/incremental.md)。
+
+```sh
+python -m visit_attribution.cli apply  --db run/store.db --source batches/b1.json
+python -m visit_attribution.cli export --db run/store.db --output run/report.json
+```
+
+批次文件沿用现有输入契约并在顶层增加 `batch_id`；首批固定 gap/lookback，`as_of`
+只进不退。同批次 ID 且源字节一致时重放无副作用，否则拒绝；跨批事件按 UTC 规范化
+去重、冲突整批拒绝，批内重复数仅在首次成功提交时累计。未来事件保留为非激活，
+水位推进时激活；迟到事件合并旧会话、更换会话 ID 并回改历史归因。事件、批次凭据与
+物化结果在单事务内提交，中断不产生半生效状态。仅重算受新激活事件影响的用户，
+重算与导出全部走流式 SQL，不把整库或整用户历史装入 Python 内存。
+
+可复现实验（含百万事件单用户倾斜下峰值 RSS ≤128 MiB 的实测）：
+
+```sh
+PYTHONPATH=src python3 -I experiments/run_experiments.py --out run/experiments
+```
+
 ## 业务与样例结果
 
 6事件中1未来排除，形成3会话、3转化/1600分；email归因1500分、unattributed100分。

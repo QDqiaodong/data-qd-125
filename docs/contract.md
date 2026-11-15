@@ -21,3 +21,6 @@ first_non_direct/last_non_direct优先选择窗口内首/末非direct；若全di
 样例6事件，1未来排除；3会话/3转化/1600分，email获1500分、unattributed获100分。
 P2因相邻间隔1801秒开新会话，但仍归给上会话窗口内email触点。
 当前全量静态快照，无迟到水位、实时流处理、跨设备合并、退款修订或持久增量状态。
+
+增量场景（批次水位、迟到事件合并、未来事件激活与持久化状态）由 SQLite 增量管道
+承担，业务规则与本契约一致，详见 [incremental.md](incremental.md)。
