@@ -3,7 +3,7 @@ import argparse, json, sqlite3, sys
 from pathlib import Path
 from .common import read, save
 from .model import analyze
-from . import erase, pipeline, privacy
+from . import commission, erase, pipeline, privacy
 
 def run(source):
     data,digest=read(source)
@@ -60,6 +60,45 @@ def privacy_main(argv):
         summary={'output':str(args.output),**summary}
     print(json.dumps(summary,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
 
+COMMISSION_COMMANDS=('commission-init','commission-sync','payout-plan','payout-confirm','payout-cancel','commission-report')
+
+def commission_main(argv):
+    parser=argparse.ArgumentParser(description=DESCRIPTION+' (offline commission ledger and payout reservations)')
+    commands=parser.add_subparsers(dest='command',required=True)
+    init_parser=commands.add_parser('commission-init',help='create a ledger with fixed channel basis-point rates')
+    init_parser.add_argument('--ledger',type=Path,required=True)
+    init_parser.add_argument('--rates',type=Path,required=True)
+    sync_parser=commands.add_parser('commission-sync',help='apply one committed source snapshot to the ledger')
+    sync_parser.add_argument('--source',type=Path,required=True)
+    sync_parser.add_argument('--ledger',type=Path,required=True)
+    sync_parser.add_argument('--sync-id',type=str,required=True)
+    plan_parser=commands.add_parser('payout-plan',help='atomically reserve commission for a multi-channel plan')
+    plan_parser.add_argument('--ledger',type=Path,required=True)
+    plan_parser.add_argument('--request',type=Path,required=True)
+    confirm_parser=commands.add_parser('payout-confirm',help='convert an active reservation into a permanent paid record')
+    confirm_parser.add_argument('--ledger',type=Path,required=True)
+    confirm_parser.add_argument('--plan-id',type=str,required=True)
+    cancel_parser=commands.add_parser('payout-cancel',help='release an active reservation')
+    cancel_parser.add_argument('--ledger',type=Path,required=True)
+    cancel_parser.add_argument('--plan-id',type=str,required=True)
+    report_parser=commands.add_parser('commission-report',help='per-channel accrued/paid/reserved/debt report')
+    report_parser.add_argument('--ledger',type=Path,required=True)
+    report_parser.add_argument('--output',type=Path,required=True)
+    args=parser.parse_args(argv)
+    if args.command=='commission-init':
+        summary=commission.init_ledger(args.ledger,args.rates)
+    elif args.command=='commission-sync':
+        summary=commission.sync(args.source,args.ledger,args.sync_id)
+    elif args.command=='payout-plan':
+        summary=commission.plan_payout(args.ledger,args.request)
+    elif args.command=='payout-confirm':
+        summary=commission.confirm_payout(args.ledger,args.plan_id)
+    elif args.command=='payout-cancel':
+        summary=commission.cancel_payout(args.ledger,args.plan_id)
+    else:
+        summary=commission.report(args.ledger,args.output)
+    print(json.dumps(summary,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
+
 def main(argv=None):
     argv=list(sys.argv[1:] if argv is None else argv)
     try:
@@ -67,6 +106,8 @@ def main(argv=None):
             return incremental_main(argv)
         if argv and argv[0] in ('privacy-init','privacy-release'):
             return privacy_main(argv)
+        if argv and argv[0] in COMMISSION_COMMANDS:
+            return commission_main(argv)
         return legacy_main(argv)
     except (ValueError,TypeError,KeyError,OSError,OverflowError,RecursionError,
             sqlite3.IntegrityError,sqlite3.Error) as error:

@@ -80,6 +80,32 @@ python -m visit_attribution.cli erase --db run/store.db --request erase.json
 # erase.json: {"request_id": "ER-001", "users": ["user-a", "user-b"]}
 ```
 
+## 离线佣金清分与付款预留
+
+另增渠道合作方佣金账簿：独立 SQLite 文件，按已物化的 `last_channel` 与
+`revenue_cents` 以整数基点算佣金（整数截断、不用浮点、不重算归因），保存当前
+权利与不可改写的正负分录，并以内部付款计划预留/确认模拟结算——**不执行外部
+支付**。源访问库只读单快照，既有命令行为不变。契约详见
+[佣金文档](docs/commission.md)。
+
+```sh
+python -m visit_attribution.cli commission-init --ledger run/commission.db --rates rates.json
+python -m visit_attribution.cli commission-sync --source run/store.db \
+    --ledger run/commission.db --sync-id S1
+python -m visit_attribution.cli payout-plan    --ledger run/commission.db --request plan.json
+python -m visit_attribution.cli payout-confirm --ledger run/commission.db --plan-id PL-1
+python -m visit_attribution.cli payout-cancel  --ledger run/commission.db --plan-id PL-1
+python -m visit_attribution.cli commission-report --ledger run/commission.db \
+    --output run/commission.json
+```
+
+费率初始化后不可改；未配置渠道、`direct`、`unattributed` 费率为 0。首次 sync
+绑定源库绝对路径，拒绝水位/代际回退与同代际异内容；同 `sync_id` 同快照幂等，
+异快照拒绝。sync 减少某渠道权利时，同一事务整单失效所有包含该渠道的未确认
+计划并释放其全部渠道预留；已确认付款不回退，而以负净余额形成欠款，后续正佣金
+先抵欠款。`commission-report` 逐渠道给出应计/已付/有效预留/可预留/欠款与计划
+状态并核对守恒。
+
 ## 业务与样例结果
 
 6事件中1未来排除，形成3会话、3转化/1600分；email归因1500分、unattributed100分。

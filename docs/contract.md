@@ -24,3 +24,7 @@ P2因相邻间隔1801秒开新会话，但仍归给上会话窗口内email触点
 
 增量场景（批次水位、迟到事件合并、未来事件激活与持久化状态）由 SQLite 增量管道
 承担，业务规则与本契约一致，详见 [incremental.md](incremental.md)。
+
+渠道合作方佣金清分与付款预留由独立 SQLite 账簿承担，只消费增量管道已物化的
+`last_channel`/`revenue_cents`，不改变本契约的归因规则，也不执行外部支付；
+详见 [commission.md](commission.md)。
